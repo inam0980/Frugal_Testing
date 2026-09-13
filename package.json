@@ -1,0 +1,22 @@
+{
+  "name": "frugal-testing-anti-ai-suite",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Section A - Practical Anti-AI Engineering & Automation (Frugal Testing / BuildNexTech AI-Native SWE Intern)",
+  "scripts": {
+    "q1:testbed": "node q1-canvas-race/testbed/server.js",
+    "q1:test": "playwright test q1-canvas-race",
+    "q2:server": "node q2-replay-hmac/server/mock-gateway.js",
+    "q2:test": "playwright test q2-replay-hmac",
+    "q3:test": "playwright test q3-shadow-dom",
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.0"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}

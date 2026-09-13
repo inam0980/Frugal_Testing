@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Sealed Enterprise Portal - Closed Shadow Boundary Testbed</title>
+<style>
+  body { margin: 0; padding: 24px; background: #0d1117; color: #c9d1d9;
+         font: 13px/1.6 "Segoe UI", system-ui, sans-serif; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  .note { color: #7d8590; max-width: 62ch; margin-bottom: 18px; }
+</style>
+</head>
+<body>
+<h1>Sealed Enterprise Portal</h1>
+<p class="note">
+  Reproduces the Q3 boundary: open shadow root &rarr; <strong>closed</strong> shadow root &rarr;
+  open shadow root. Class strings and element ids are regenerated on every load
+  <em>and every 1.5s thereafter</em>. A decoy control with identical visible text sits
+  in the outer root, reachable by ordinary text matching.
+</p>
+
+<enterprise-portal></enterprise-portal>
+
+<script>
+(() => {
+  'use strict';
+
+  // --- obfuscation source ---------------------------------------------------
+  // Regenerates the token pool so nothing derived from a class string or an id
+  // survives a reload, let alone the periodic churn below.
+  const churn = () => Math.random().toString(36).slice(2, 8);
+
+  const registry = { rotations: 0 };
+
+  // ==========================================================================
+  // <security-sandbox>  - innermost, OPEN shadow root, holds the real target
+  // ==========================================================================
+  class SecuritySandbox extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>
+          .${'w_' + churn()} { display: block; }
+          button { font: inherit; padding: 8px 14px; border-radius: 6px; cursor: pointer;
+                   border: 1px solid #2f81f7; background: #1f6feb; color: #fff; }
+          [data-state="locked"] { opacity: .5; cursor: not-allowed; }
+          .status { margin-top: 10px; font-size: 12px; color: #7d8590; }
+        </style>
+        <div class="${'wrap_' + churn()}" id="${'w' + churn()}">
+          <button
+            class="${'trigger_' + churn()}"
+            id="${'b' + churn()}"
+            role="button"
+            aria-label="Authorize Ledger Funds"
+            data-qa-state="unlocked-token"
+            data-state="unlocked"
+          >Authorize Ledger Funds</button>
+          <div class="status" role="status" aria-live="assertive" aria-atomic="true"></div>
+        </div>
+      `;
+
+      const button = root.querySelector('button');
+      const live = root.querySelector('[role="status"]');
+
+      button.addEventListener('click', () => {
+        registry.authorized = (registry.authorized || 0) + 1;
+        // The only externally observable result of a successful activation is an
+        // aria-live announcement - deliberately, so the suite has to read the
+        // accessibility tree rather than scrape markup.
+        live.textContent = `Ledger authorization committed (ref ${registry.authorized})`;
+        button.setAttribute('data-state', 'committed');
+        button.setAttribute('aria-disabled', 'true');
+      });
+
+      // Periodic obfuscation churn. Roles, aria-label and aria-live survive;
+      // every class string and id does not.
+      setInterval(() => {
+        registry.rotations += 1;
+        button.className = 'trigger_' + churn();
+        button.id = 'b' + churn();
+        const wrap = root.querySelector('div');
+        wrap.className = 'wrap_' + churn();
+        wrap.id = 'w' + churn();
+      }, 1500);
+    }
+  }
+
+  // ==========================================================================
+  // <payment-terminal> - CLOSED shadow root
+  //
+  // The root reference is kept in a module-scoped WeakMap and never assigned to
+  // the element, so `el.shadowRoot` is null for any outside caller. This is the
+  // boundary that defeats ordinary recursive `.shadowRoot` traversal.
+  // ==========================================================================
+  const sealed = new WeakMap();
+
+  class PaymentTerminal extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: 'closed' });
+      sealed.set(this, root);
+
+      root.innerHTML = `
+        <style>
+          .${'p_' + churn()} { display: block; }
+          fieldset { border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+          legend { color: #7d8590; font-size: 12px; }
+        </style>
+        <fieldset class="${'panel_' + churn()}" id="${'p' + churn()}">
+          <legend>payment-terminal :: closed boundary</legend>
+          <security-sandbox></security-sandbox>
+        </fieldset>
+      `;
+    }
+  }
+
+  // ==========================================================================
+  // <enterprise-portal> - OPEN shadow root, plus the decoy
+  // ==========================================================================
+  class EnterprisePortal extends HTMLElement {
+    connectedCallback() {
+      const root = this.attachShadow({ mode: 'open' });
+      root.innerHTML = `
+        <style>
+          .${'g_' + churn()} { display: block; }
+          .decoy { font: inherit; margin-bottom: 14px; padding: 8px 14px; border-radius: 6px;
+                   border: 1px dashed #6e7681; background: transparent; color: #6e7681; }
+        </style>
+        <div class="${'gate_' + churn()}" id="${'g' + churn()}">
+          <!-- Decoy: same visible text, but hidden from the accessibility tree.
+               A text-content or CSS-class locator finds this one first. -->
+          <button class="decoy ${'trigger_' + churn()}" id="${'d' + churn()}"
+                  aria-hidden="true" disabled>Authorize Ledger Funds</button>
+          <payment-terminal class="${'obfuscated_' + churn()}" id="${'t' + churn()}"></payment-terminal>
+        </div>
+      `;
+    }
+  }
+
+  customElements.define('security-sandbox', SecuritySandbox);
+  customElements.define('payment-terminal', PaymentTerminal);
+  customElements.define('enterprise-portal', EnterprisePortal);
+
+  // Corroboration only. The suite asserts through the accessibility tree; this
+  // exists so a failure can be explained without guessing.
+  window.__PORTAL_STATE__ = () => ({ ...registry });
+})();
+</script>
+</body>
+</html>

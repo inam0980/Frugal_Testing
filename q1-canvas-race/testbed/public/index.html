@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Frugal Canvas Terminal - Streaming Ledger Grid</title>
+<style>
+  html, body {
+    margin: 0;
+    background: #05080b;
+    color: #7d8b9a;
+    font: 12px/1.5 "Segoe UI", system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding-top: 18px;
+  }
+  /* The canvas is the entire application surface. There is deliberately no
+     button, label, input or aria node for an automation tool to latch onto -
+     every piece of state below is readable only as pixels. */
+  #terminal {
+    width: 900px;
+    height: 520px;
+    display: block;
+    background: #0b0f14;
+  }
+  p { margin: 0; letter-spacing: .04em; }
+</style>
+</head>
+<body>
+<canvas id="terminal" width="900" height="520"></canvas>
+<p>canvas-only surface &mdash; no DOM locators, no aria tree, no text nodes</p>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Palette. These exact RGB triples are the application's public contract with
+  // the pixel-probing test engine: they are how state is published.
+  // ---------------------------------------------------------------------------
+  const C = {
+    bg:        '#0b0f14',
+    gridline:  '#1b2430',   // rgb(27, 36, 48)   - used to derive grid geometry
+    loading:   '#808080',   // rgb(128,128,128)  - implicit gray loading threshold
+    up:        '#16a34a',   // rgb(22, 163, 74)  - active, tick up
+    down:      '#dc2626',   // rgb(220,38, 38)   - active, tick down
+    armed:     '#a855f7',   // rgb(168,85, 247)  - chained interaction completed
+    hover:     '#38bdf8',
+    panel:     '#10161d',
+    boundary:  '#d98324',   // amber - structured exception boundary tripped
+    text:      '#9fb0c0',
+    textDim:   '#5a6875',
+  };
+
+  const GRID = { x: 40, y: 96, cols: 6, rows: 3, cellW: 136, cellH: 108, line: 3 };
+  const FOOTER = { x: 40, y: 440, w: 816, h: 72 };
+  const TARGET_CELL = 7;
+  const DRAG_THRESHOLD_PX = 12;   // a 15px drag must clear this; a jitter nudge must not
+
+  const canvas = document.getElementById('terminal');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+  // ---------------------------------------------------------------------------
+  // Application state
+  // ---------------------------------------------------------------------------
+  const cells = Array.from({ length: GRID.cols * GRID.rows }, () => ({
+    state: 'loading',        // 'loading' | 'up' | 'down'
+    price: null,
+  }));
+
+  const state = {
+    connected: false,
+    lastSeq: 0,
+    framesApplied: 0,
+    staleDrops: 0,           // frames arriving out of order because of injected jitter
+    drifts: 0,               // target-cell resubscribes seen
+    balance: null,
+    boundary: null,          // { code, raw, at } when the exception boundary trips
+    acceptedBalances: [],    // every value the app rendered without complaint
+  };
+
+  const interaction = {
+    phase: 'idle',           // idle -> hovered -> dragged -> armed
+    isDown: false,
+    dragStartX: null,
+    dragDx: 0,
+    dragCleared: false,
+    suppressNextClick: false,
+    marks: {},               // phase -> performance.now()
+  };
+
+  // ---------------------------------------------------------------------------
+  // Geometry helpers (shared with the renderer; the test derives these from
+  // pixels instead of reading them, which is the whole point of the exercise)
+  // ---------------------------------------------------------------------------
+  function cellRect(index) {
+    const col = index % GRID.cols;
+    const row = Math.floor(index / GRID.cols);
+    return {
+      x: GRID.x + col * GRID.cellW,
+      y: GRID.y + row * GRID.cellH,
+      w: GRID.cellW,
+      h: GRID.cellH,
+    };
+  }
+
+  function hitTest(px, py) {
+    for (let i = 0; i < cells.length; i += 1) {
+      const r = cellRect(i);
+      if (px >= r.x && px < r.x + r.w && py >= r.y && py < r.y + r.h) return i;
+    }
+    return -1;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Balance validation - the "structured exception boundary".
+  //
+  // NOTE (intentional, and the finding Q1 spec 4 is designed to surface): this
+  // guard only rejects non-numeric / NaN input. It has no magnitude ceiling and
+  // no precision rule, so a scientific-notation value such as 1e+7 or a
+  // float-artefact balance such as 0.30000000000000004 is accepted and rendered
+  // as if it were legitimate. A real ledger UI must reject both.
+  // ---------------------------------------------------------------------------
+  function validateBalance(raw) {
+    if (typeof raw !== 'number' || Number.isNaN(raw)) {
+      return { ok: false, code: 'E_NON_NUMERIC' };
+    }
+    return { ok: true };
+  }
+
+  function applyFrame(frame) {
+    // Injected latency reorders frames, so guard the sequence explicitly.
+    if (typeof frame.seq === 'number' && frame.seq <= state.lastSeq) {
+      state.staleDrops += 1;
+      return;
+    }
+    state.lastSeq = frame.seq;
+    state.framesApplied += 1;
+
+    // State drift: the upstream feed re-subscribed this cell. It drops back to
+    // the gray loading threshold and any interaction state attached to it is
+    // discarded - a cell that was armed is no longer armed.
+    if (frame.resubscribe === true && cells[frame.cell]) {
+      cells[frame.cell].state = 'loading';
+      cells[frame.cell].price = null;
+      if (frame.cell === TARGET_CELL) {
+        interaction.phase = 'idle';
+        interaction.isDown = false;
+        interaction.dragStartX = null;
+        interaction.dragDx = 0;
+        interaction.dragCleared = false;
+        interaction.suppressNextClick = false;
+        interaction.marks = {};
+        state.drifts += 1;
+      }
+      return;
+    }
+
+    if (typeof frame.cell === 'number' && cells[frame.cell]) {
+      cells[frame.cell].state = frame.dir === 'down' ? 'down' : 'up';
+      cells[frame.cell].price = frame.price;
+    }
+
+    const verdict = validateBalance(frame.balance);
+    if (!verdict.ok) {
+      state.boundary = { code: verdict.code, raw: String(frame.balance), at: Date.now() };
+      return;
+    }
+    state.balance = frame.balance;
+    state.acceptedBalances.push(frame.balance);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Transport
+  // ---------------------------------------------------------------------------
+  const wsUrl = `ws://${location.host}/stream`;
+  let socket;
+
+  function connect() {
+    socket = new WebSocket(wsUrl);
+    socket.addEventListener('open', () => { state.connected = true; });
+    socket.addEventListener('close', () => { state.connected = false; });
+    socket.addEventListener('message', (evt) => {
+      let frame;
+      try {
+        frame = JSON.parse(evt.data);
+      } catch (err) {
+        state.boundary = { code: 'E_MALFORMED_FRAME', raw: String(evt.data).slice(0, 60), at: Date.now() };
+        return;
+      }
+      applyFrame(frame);
+    });
+  }
+  connect();
+
+  // ---------------------------------------------------------------------------
+  // Pointer handling. The app requires the full chain in order:
+  //   hover the target cell -> drag >= 12px on X -> a separate click
+  // A bare click, or a click without a preceding drag, does nothing.
+  // ---------------------------------------------------------------------------
+  function localCoords(evt) {
+    const r = canvas.getBoundingClientRect();
+    return {
+      x: (evt.clientX - r.left) * (canvas.width / r.width),
+      y: (evt.clientY - r.top) * (canvas.height / r.height),
+    };
+  }
+
+  canvas.addEventListener('mousemove', (evt) => {
+    const { x, y } = localCoords(evt);
+    const idx = hitTest(x, y);
+
+    if (interaction.isDown && interaction.dragStartX !== null) {
+      interaction.dragDx = x - interaction.dragStartX;
+      if (Math.abs(interaction.dragDx) >= DRAG_THRESHOLD_PX) {
+        interaction.dragCleared = true;
+      }
+      return;
+    }
+
+    if (idx === TARGET_CELL && interaction.phase === 'idle') {
+      interaction.phase = 'hovered';
+      interaction.marks.hovered = performance.now();
+    }
+  });
+
+  canvas.addEventListener('mousedown', (evt) => {
+    const { x, y } = localCoords(evt);
+    if (hitTest(x, y) !== TARGET_CELL) return;
+    if (interaction.phase !== 'hovered') return;   // must be hovered first
+    interaction.isDown = true;
+    interaction.dragStartX = x;
+    interaction.dragDx = 0;
+    interaction.dragCleared = false;
+  });
+
+  canvas.addEventListener('mouseup', () => {
+    if (!interaction.isDown) return;
+    interaction.isDown = false;
+    if (interaction.dragCleared) {
+      interaction.phase = 'dragged';
+      interaction.marks.dragged = performance.now();
+      // The mouseup that ends a drag also synthesises a click event; ignore it
+      // so that arming still requires a deliberate, separate click.
+      interaction.suppressNextClick = true;
+    }
+    interaction.dragStartX = null;
+  });
+
+  canvas.addEventListener('click', (evt) => {
+    if (interaction.suppressNextClick) {
+      interaction.suppressNextClick = false;
+      return;
+    }
+    const { x, y } = localCoords(evt);
+    if (hitTest(x, y) !== TARGET_CELL) return;
+    if (interaction.phase !== 'dragged') return;
+    interaction.phase = 'armed';
+    interaction.marks.armed = performance.now();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Renderer - flat fills only, so every probe point reads one unambiguous RGB
+  // ---------------------------------------------------------------------------
+  function drawHeader() {
+    ctx.fillStyle = C.panel;
+    ctx.fillRect(40, 24, 816, 52);
+
+    ctx.fillStyle = C.text;
+    ctx.font = '600 15px Consolas, monospace';
+    ctx.fillText('LEDGER STREAM / CANVAS GRID', 56, 47);
+
+    ctx.fillStyle = C.textDim;
+    ctx.font = '12px Consolas, monospace';
+    const bal = state.balance === null ? '--' : String(state.balance);
+    ctx.fillText(`balance ${bal}`, 56, 66);
+    ctx.fillText(
+      `seq ${state.lastSeq}   applied ${state.framesApplied}   stale ${state.staleDrops}   drift ${state.drifts}`,
+      320,
+      66
+    );
+
+    ctx.beginPath();
+    ctx.arc(836, 50, 7, 0, Math.PI * 2);
+    ctx.fillStyle = state.connected ? C.up : C.loading;
+    ctx.fill();
+  }
+
+  function drawGrid() {
+    for (let i = 0; i < cells.length; i += 1) {
+      const r = cellRect(i);
+      const cell = cells[i];
+
+      let fill = C.loading;
+      if (i === TARGET_CELL && interaction.phase === 'armed') fill = C.armed;
+      else if (cell.state === 'up') fill = C.up;
+      else if (cell.state === 'down') fill = C.down;
+
+      ctx.fillStyle = fill;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+
+      if (cell.price !== null) {
+        ctx.fillStyle = 'rgba(5,8,11,0.72)';
+        ctx.font = '11px Consolas, monospace';
+        ctx.fillText(cell.price.toFixed(2), r.x + 10, r.y + r.h - 12);
+      }
+    }
+
+    // Grid separators. Drawn last and in a single flat colour so the test can
+    // recover the column/row boundaries by scanning for runs of this RGB.
+    ctx.fillStyle = C.gridline;
+    for (let c = 0; c <= GRID.cols; c += 1) {
+      ctx.fillRect(GRID.x + c * GRID.cellW - GRID.line / 2, GRID.y, GRID.line, GRID.rows * GRID.cellH);
+    }
+    for (let r = 0; r <= GRID.rows; r += 1) {
+      ctx.fillRect(GRID.x, GRID.y + r * GRID.cellH - GRID.line / 2, GRID.cols * GRID.cellW, GRID.line);
+    }
+
+    // Hover affordance on the target cell.
+    if (interaction.phase === 'hovered' || interaction.phase === 'dragged') {
+      const r = cellRect(TARGET_CELL);
+      ctx.strokeStyle = C.hover;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(r.x + 2, r.y + 2, r.w - 4, r.h - 4);
+
+      if (interaction.phase === 'dragged' || interaction.isDown) {
+        const handleX = r.x + r.w / 2 + Math.max(-40, Math.min(40, interaction.dragDx));
+        ctx.fillStyle = C.hover;
+        ctx.fillRect(handleX - 3, r.y + r.h - 30, 6, 18);
+      }
+    }
+  }
+
+  function drawFooter() {
+    const tripped = Boolean(state.boundary);
+    ctx.fillStyle = tripped ? C.boundary : C.panel;
+    ctx.fillRect(FOOTER.x, FOOTER.y, FOOTER.w, FOOTER.h);
+
+    ctx.fillStyle = tripped ? '#1a1207' : C.textDim;
+    ctx.font = '12px Consolas, monospace';
+    ctx.fillText(
+      tripped
+        ? `EXCEPTION BOUNDARY ACTIVE  ${state.boundary.code}  raw=${state.boundary.raw}`
+        : 'exception boundary idle - no rejected frames',
+      FOOTER.x + 16,
+      FOOTER.y + 28
+    );
+    ctx.fillText(`interaction phase: ${interaction.phase}`, FOOTER.x + 16, FOOTER.y + 50);
+  }
+
+  function frame() {
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    drawHeader();
+    drawGrid();
+    drawFooter();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // Exposed only as corroboration for assertions that pixels cannot express
+  // (e.g. the exact numeric value the app accepted). State *readiness* is never
+  // read from here by the test - that always comes from the canvas pixels.
+  window.__TERMINAL__ = {
+    palette: C,
+    grid: GRID,
+    targetCell: TARGET_CELL,
+    snapshot: () => ({
+      lastSeq: state.lastSeq,
+      framesApplied: state.framesApplied,
+      staleDrops: state.staleDrops,
+      drifts: state.drifts,
+      balance: state.balance,
+      boundary: state.boundary,
+      acceptedBalances: state.acceptedBalances.slice(-25),
+      phase: interaction.phase,
+      marks: { ...interaction.marks },
+    }),
+  };
+})();
+</script>
+</body>
+</html>
