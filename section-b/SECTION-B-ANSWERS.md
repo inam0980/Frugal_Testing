@@ -13,18 +13,16 @@
 
 **1. The structural vulnerability**
 
-The loop has no independent oracle. Agent B infers *expected* behaviour by reading
-Agent A's source, so specification and implementation collapse into one artifact —
-and a suite written from the code under test can detect that the code *changed*,
-never that it is *wrong*.
+The loop has no independent oracle. Agent B infers *expected* behaviour from Agent
+A's source, so specification and implementation collapse into one artifact — and a
+suite written from the code under test detects that code *changed*, never that it is
+*wrong*.
 
-Dependency mirroring converts that single defect into three approvals drawn from one
-information source. A's race condition becomes B's asserted baseline; C reads only
-B's green report, so C's sign-off is a pure function of A's diff. The chain looks
-like defence in depth and is one point of failure with two amplifiers.
-
-Confidence also rises falsely: a human reviewing three agreeing agents reasonably
-infers corroboration that does not exist.
+Dependency mirroring turns one defect into three approvals from one information
+source. A's race condition becomes B's asserted baseline; C reads only B's green
+report, so C's sign-off is a pure function of A's diff. It looks like defence in
+depth and is one point of failure with two amplifiers — and a human seeing three
+agents agree infers corroboration that does not exist.
 
 **2. The external deterministic layer**
 
@@ -48,29 +46,24 @@ Agent A's diff.** Everything else is hygiene.
 
 **1. Sequence of events**
 
-`processor.js` reads frames faster than it completes them, so socket descriptor 12
-overflows — no backpressure is applied. Each frame enters a promise chain, and every
-unresolved promise's closure retains its captured payload, so 68,240 pending closures
-pin 68,240 buffers.
+`processor.js` reads faster than it completes, so socket 12 overflows with no
+backpressure. Each frame enters a promise chain whose closure retains its payload, so
+68,240 pending closures pin 68,240 buffers.
 
-The retained set grows monotonically to 98.4%, and V8 responds with full mark-compact
-cycles every 12 ms. That is the inversion point: GC owns the thread, the microtask
-queue — the only mechanism that could *drain* those closures — never runs, and the
-socket keeps delivering. Compaction is reported "ineffective" precisely because
-nothing is unreachable.
-
-Root cause is unbounded queueing, not a classical leak.
+The retained set reaches 98.4% and V8 answers with mark-compact every 12 ms. That is
+the inversion: GC owns the thread, the microtask queue that would *drain* those
+closures never runs, and frames keep arriving. Compaction is "ineffective" because
+nothing is unreachable — unbounded queueing, not a leak.
 
 **2. Why functional E2E reports green**
 
-The failure is a function of *concurrent arrival rate × retention time*. One user
-drives one socket: the buffer never saturates, each promise resolves before the next
-frame arrives, retention stays near zero, and V8 never leaves the scavenger.
+The failure scales with *concurrent arrival rate × retention time*. One user drives
+one socket: promises resolve before the next frame arrives, retention stays near
+zero, and V8 never leaves the scavenger.
 
 Functional checks also assert the wrong property class — *output correctness*, which
-remains correct until the instant the process dies. Nothing in the suite asserts
-queue depth, heap fraction, GC pause share, or event-loop lag, so there is nothing
-to fail on.
+stays correct until the process dies. Nothing asserts the resource ceilings below, so
+there is nothing to fail on.
 
 | Gate that would catch it | Ceiling |
 |---|---|
@@ -172,19 +165,19 @@ allow-listed equivalent. Never produce the unsafe version alongside a warning.
 **1. Why it is severely flaky on shared-core runners**
 
 `setTimeout(15000)` encodes a guess about someone else's scheduler. On a shared vCPU,
-steal time and noisy neighbours mean replication finishes in 2 s or 40 s.
+steal time means replication finishes in 2 s or 40 s.
 
 Worse, `isVisible()` samples once. A toast rendering at 15.1 s reads false — and one
-that auto-dismissed at 14 s also reads false. It fails in both directions, which is
-why the flake looks random.
+auto-dismissed at 14 s also reads false. It fails in both directions, which is why
+the flake looks random.
+
+
 
 `performance.mark` reads `CLOCK_MONOTONIC` while the assumption is wall-clock;
-ephemeral containers rarely run NTP, and the two clocks diverge across host suspend
-and VM migration. The `else` branch then reloads, discarding transaction context and
-risking a double submit.
-
-With no assertion the test cannot fail — it silently takes the wrong branch and
-reports green.
+ephemeral containers rarely run NTP, so the clocks diverge across host suspend and VM
+migration. The `else` branch then reloads, discarding transaction context and risking
+a double submit. With no assertion the test cannot fail — it silently takes the wrong
+branch and reports green.
 
 **2. Refactored implementation**
 
@@ -233,9 +226,9 @@ test('ledger transaction completes and can be confirmed', async ({ page }) => {
 });
 ```
 
-If the app emits no such event, use `page.waitForResponse` on the replication
-endpoint or `expect.poll` against a status API — never a sleep. An unobservable wait
-is a **testability defect to fix upstream**, not a duration to tune.
+If no such event exists, use `page.waitForResponse` or `expect.poll` against a status
+API — never a sleep. An unobservable wait is a **testability defect**, not a duration
+to tune.
 
 ---
 
@@ -356,25 +349,25 @@ Alert on the *conjunction* of plateau and high activity; either alone is normal.
 **1. System logic**
 
 Line diffs are the wrong granularity — a reformat changes every line and no
-behaviour. Parse both revisions to ASTs and diff at **declaration** level, yielding
-changed symbols: functions, methods, classes, exported members, schema and constant
-definitions.
+behaviour. Diff the two revisions' ASTs at **declaration** level instead, yielding
+changed symbols: functions, classes, exported members and schema definitions.
 
-Resolve impact through two graphs. A **static graph** built from imports, call sites,
-DI bindings and route registrations gives each changed symbol's transitive
-reverse-dependency closure. A **dynamic coverage map** from prior runs records which
-test executed which symbol. Intersect them.
+Resolve impact through two graphs. A **static graph** from imports, call sites, DI
+bindings and route registrations gives each symbol's transitive reverse-dependency
+closure; a **dynamic coverage map** records which test executed which symbol.
+Intersect them, then rank by historical failure correlation and cost.
 
-Rank candidates by historical failure correlation and execution cost, running highest
-signal-per-second first so the pipeline fails fast. Classify the change: body-only
-edits select narrowly; signature, schema or configuration changes widen the closure
-sharply.
+| Change class | Closure width |
+|---|---|
+| body-only edit | narrow — direct callers |
+| signature change | wide — every call site and its transitive callers |
+| schema / config / framework change | full suite (see fail-open below) |
 
 **2. Minimising the subset without losing distributed coverage**
 
-Selection is an optimisation with a non-negotiable **safety floor**. Coverage maps
-are blind to reflection, DI, dynamic imports, serialised boundaries and
-config-driven wiring — exactly the mechanisms distributed systems are built from.
+Selection needs a non-negotiable **safety floor**: coverage maps are blind to
+reflection, DI, dynamic imports and config-driven wiring — the mechanisms
+distributed systems are built from.
 
 | Always-run overlay | Reason |
 |---|---|
@@ -384,9 +377,9 @@ config-driven wiring — exactly the mechanisms distributed systems are built fr
 | **fail-open triggers** — build config, shared schema, framework version, IaC | run everything |
 
 Then measure the framework itself: nightly full runs compute **selection recall** —
-failures the full run caught that selection would have skipped. Publish it as an SLO
-and widen the closure when it drops. Selection without a measured recall number is a
-hope, not a control.
+failures selection would have skipped. Publish it as an SLO; below target, widen the
+closure. Selection without a measured recall is a hope, not a control.
+
 
 ---
 
@@ -402,11 +395,10 @@ which correlate with *appearance*, not identity. `.btn-danger` and
 that resemblance as evidence of sameness.
 
 **Best-match-wins with no absolute floor** — ranking always yields a winner, so the
-nearest candidate is selected even when every candidate is poor.
+nearest candidate wins even when every candidate is poor.
 
 **Absence treated as neutral** — nothing resembled the original locator, which is
-strong evidence the element was *removed* and should collapse confidence. It was
-ignored.
+evidence the element was *removed* and should collapse confidence.
 
 **Consequence was not a variable** — likelihood was weighed, cost never was. Closing
 a modal and wiping a cluster scored identically, and healing was permitted to *act*
@@ -414,7 +406,7 @@ rather than propose.
 
 **2. Confirmation protocol and scoring model**
 
-Composite score, components normalised to [0,1]:
+Composite score, normalised to [0,1]:
 
 | Signal | Weight | Computation |
 |---|---|---|
@@ -435,8 +427,7 @@ Hard gates, evaluated **before** the score is consulted:
 | 5 | **Two-signal confirmation** — above threshold, verify against an independent signal (state transition or `aria-live` announcement) in a dry-run environment before committing |
 
 Governing principle: **a self-healing engine may reduce false negatives; it must
-never be permitted to create an irreversible false positive.** The expected cost of a
-destructive false positive is unbounded; a failed test costs one engineer-hour.
+never create an irreversible false positive.**
 
 ---
 
@@ -566,14 +557,13 @@ autoscaling reacts, and Kafka absorbs the difference.
 **Span 5 — `LedgerDB`, Lock Wait Timeout Exceeded, 2043 ms.** It accounts for 2043 of
 the gateway's 2150 ms, so everything above it is waiting, not failing.
 
-Read the tree by *self-time*. `LedgerEngine` shows 2138 ms ERROR but 2043 ms of that
-sits in its child, leaving ~95 ms of its own — it is a **propagator**, not the fault.
+Read the tree by *self-time*. `LedgerEngine` shows 2138 ms ERROR but 2043 ms sits in
+its child, leaving ~95 ms of its own — a **propagator**, not the fault.
 `TokenService` (12 ms) and `AccountService` (95 ms) are healthy.
 
-The proximate cause is row-lock contention on `user_accounts` id=92. `AuditBalances`
-reads that row earlier in the same transaction, so the read-then-write pattern
-extends the lock hold window and serialises every concurrent transfer behind the
-slowest one.
+The proximate cause is row-lock contention on `user_accounts` id=92: `AuditBalances`
+reads that row earlier in the same transaction, so read-then-write extends the lock
+hold window and serialises every concurrent transfer behind the slowest.
 
 **2. How correlation tokens cross container boundaries**
 
@@ -590,14 +580,13 @@ share no memory.
 
 **3. Triage briefing sheet — Database Platform Team**
 
-> **To:** Database Platform · **Severity:** P1, launch blocker
-> **Trace:** `POST /v5/payment/process` → Span 5 · `LedgerDB` · Lock Wait Timeout
-> **Symptom:** 2043 ms lock wait on `user_accounts` id=92 under concurrent checkout
-> load, surfacing as HTTP 500 at the gateway.
-> **Diagnosis:** row-lock contention with an over-long hold window — not
-> insufficient capacity. The application reads the balance (Span 4) and updates it
-> (Span 5) inside one transaction, so the queue is as long as the *transaction*,
-> not as long as the update.
+| Field | Detail |
+|---|---|
+| **To** | Database Platform team |
+| **Severity** | P1 — launch blocker |
+| **Trace** | `POST /v5/payment/process` → Span 5 · `LedgerDB` · Lock Wait Timeout |
+| **Symptom** | 2043 ms lock wait on `user_accounts` id=92 under concurrent checkout load, surfacing as HTTP 500 at the gateway |
+| **Diagnosis** | Row-lock contention with an over-long hold window — not insufficient capacity. The application reads the balance (Span 4) and updates it (Span 5) inside one transaction, so the queue is as long as the *transaction*, not as long as the update. |
 
 | # | Requested change | Rationale |
 |---|---|---|
@@ -608,13 +597,11 @@ share no memory.
 | 5 | Evaluate `READ COMMITTED` in place of `REPEATABLE READ` **for this path only** | Under RR, InnoDB takes gap and next-key locks on range predicates, widening the footprint beyond the target row. **Verify first** that nothing in this transaction depends on repeatable reads. |
 | 6 | Confirm the update resolves via the primary key; audit neighbouring queries for range predicates on non-unique indexes | A range scan under RR gap-locks rows the statement never touches |
 
-> **Explicitly not recommended:** `READ UNCOMMITTED` (dirty reads of balances are
-> unacceptable in a ledger) and `SERIALIZABLE` (worsens this). Raising the connection
-> pool also worsens it — more concurrent writers on one row lengthens the queue.
->
-> **Verification:** `innodb_row_lock_waits`, `innodb_row_lock_time_avg`,
-> `performance_schema.data_lock_waits` blocking chains, deadlock count, Span 5 p99.
-> **Exit criterion:** Span 5 p99 < 50 ms at simulated load, zero lock timeouts.
+| Field | Detail |
+|---|---|
+| **Not recommended** | `READ UNCOMMITTED` — dirty reads of balances are unacceptable in a ledger. `SERIALIZABLE` — worsens this. Raising the connection pool — more concurrent writers on one row lengthens the queue. |
+| **Verification metrics** | `innodb_row_lock_waits` · `innodb_row_lock_time_avg` · `performance_schema.data_lock_waits` blocking chains · deadlock count · Span 5 p99 |
+| **Exit criterion** | Span 5 p99 < 50 ms at simulated load, zero lock timeouts |
 
 ---
 
@@ -624,17 +611,16 @@ share no memory.
 
 The developer is **debugging by complaint**. Requirements arrive serially — nesting
 and ISO timestamps in turn 2, multiline in turn 3 — so every answer was optimal for a
-specification already obsolete. No failing input, no expected output: "still throwing
-errors" carries almost no discriminative signal.
+specification already obsolete. "Still throwing errors" carries almost no
+discriminative signal: no failing input, no expected output.
 
 Context degrades because the window fills with **superseded wrong answers**. The
 model attends to its own prior output and anchors on the approach it already chose,
-patching a brace-counting regex instead of abandoning it. Attention budget is spent
-re-reading three dead patterns.
+patching a brace-counting regex rather than abandoning it.
 
-The decisive failure is that nobody re-examined the premise: **balanced nesting is
-not a regular language.** The conversation iterates inside an impossible problem
-class, and refinement cannot escape it — each turn presupposes the approach is sound.
+The decisive failure: nobody re-examined the premise. **Balanced nesting is not a
+regular language.** The conversation iterates inside an impossible problem class, and
+refinement cannot escape it — every turn presupposes the approach is sound.
 
 **2. Restructured single-shot CoT + few-shot prompt**
 
@@ -710,10 +696,8 @@ expression cannot do this", say it and give the correct alternative. Do not prod
 a regex that works on the examples and fails at depth 4.
 ````
 
-It converges in one turn because every constraint is stated up front, Step 1 forces
-the model to confront the formal limit before committing, the four examples act as
-executable acceptance criteria, and the mandatory LIMITATIONS section removes the
-incentive to overclaim.
+It converges in one turn: every constraint is stated up front, and Step 1 forces the
+model to confront the formal limit before committing.
 
 ---
 
@@ -810,11 +794,10 @@ bounded time, with no state change and no internal detail leaked.**
 
 **1. Architecture and rules engine**
 
-Five stages, with one rule that makes the whole thing trustworthy: **the gate is
-deterministic, and no LLM holds a veto.** An LLM may summarise the decision and draft
-the rollback narrative; it never computes the verdict, because a non-deterministic
-sign-off is not a sign-off — and Q4's cascading drift is exactly what happens when
-generated judgement enters the gate.
+Five stages, with one rule that makes it trustworthy: **the gate is deterministic,
+and no LLM holds a veto.** An LLM may summarise the decision; it never computes the
+verdict, because a non-deterministic sign-off is not a sign-off — Q4's cascading
+drift is what happens when generated judgement enters the gate.
 
 | Stage | Function |
 |---|---|
@@ -832,9 +815,8 @@ tested rollback.
 **2. Ingesting, weighting and correlating**
 
 Raw metrics are not comparable, so each is normalised to a 0–1 risk contribution and
-weighted by demonstrated correlation with past incidents — recalibrated quarterly
-against the actual incident record, so weights are empirical rather than negotiated
-in a meeting.
+weighted by correlation with past incidents — recalibrated quarterly against the
+incident record, so weights are empirical rather than negotiated in a meeting.
 
 | Signal | Weight | Normalisation | Why this shape |
 |---|---|---|---|
@@ -861,13 +843,12 @@ in a meeting.
 The link is a **shared identifier discipline** established at build time, not
 inferred later. Every artifact carries a `release_sha`; every span carries
 `release_sha`, `route` and `service`; every test declares the routes and symbols it
-covers, from its coverage report. Those three facts make the join work in both
-directions.
+covers, from its coverage report. Those three facts make the join work both ways.
 
 The highest-value direction is production → test: an error signature maps to an
 owning route, which maps to the tests covering it. **If that set is empty, the
-incident is automatically filed as a coverage gap** with the failing trace attached —
-the best test-backlog source a team has.
+incident is filed as a coverage gap** with the failing trace attached — the best
+test-backlog source a team has.
 
 | Direction | Mechanism |
 |---|---|
@@ -900,7 +881,7 @@ risk = traffic_share × error_rate_delta × latency_p99_regression × change_fre
 
 This closes the loop: production tells the pipeline what to test, the pipeline tests
 it under injected stress, and production decides whether the result was acceptable —
-with no human in the latency path and a deterministic rollback when it was not.
+no human in the latency path, deterministic rollback when it was not.
 
 ---
 

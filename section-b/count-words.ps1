@@ -17,7 +17,8 @@ param(
 $raw = Get-Content $Path -Raw
 
 # Strip fenced blocks first, so their contents cannot leak into the prose count.
-$clean = [regex]::Replace($raw, '(?s)```.*?```', '')
+# Matches 3-or-more backtick fences, since prompt blocks use ```` to nest ```.
+$clean = [regex]::Replace($raw, '(?s)`{3,}.*?`{3,}', '')
 
 # Drop table rows.
 $clean = ($clean -split "`n" | Where-Object { $_ -notmatch '^\s*\|' }) -join "`n"
@@ -31,8 +32,12 @@ $fail = 0
 foreach ($s in $sections) {
   if ($s -notmatch '^(Q\d+|Behavioural)') { continue }
 
-  $title = (($s -split "`n")[0]).Trim()
-  $body = $s -replace '[#*`_>]', ' '
+  $lines = $s -split "`n"
+  $title = ($lines[0]).Trim()
+
+  # Drop the heading line itself: that is the question, not the answer.
+  # Everything else in the section counts, including sub-part labels.
+  $body = (($lines | Select-Object -Skip 1) -join "`n") -replace '[#*`_>]', ' '
   $words = ($body -split '\s+' | Where-Object { $_ -match '\w' }).Count
 
   $status = if ($words -gt $Limit) { $fail++; 'OVER LIMIT' } else { 'ok' }
